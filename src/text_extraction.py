@@ -112,3 +112,4 @@ def extract_text(file_content: bytes, file_name: str) -> Optional[str]:
         raise ValueError(f"Unsupported file type: {file_name}. Supported formats: PDF, DOCX, TXT")
 
 
+

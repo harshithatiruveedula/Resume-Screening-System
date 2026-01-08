@@ -308,154 +308,53 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
             total_chars = sum(len(doc) for doc in all_documents)
             st.info(f"📄 Processing FULL documents: Job ({len(job_description)} chars) + {len(resume_texts)} resume(s) = {total_chars:,} total characters")
             
-            # Step 3: Create TF-IDF vectorizer with word normalization
-            # This step handles text preprocessing: lowercasing, lemmatization, stopword removal
-            # Preprocessing ensures:
-            # - Case-insensitive matching (lowercasing)
-            # - Word form normalization (lemmatization: "building" → "build")
-            # - Stopword removal (removes "the", "is", etc. but keeps domain keywords)
-            # - Special characters and extra whitespace handled by tokenizer
+            # Step 2: Create TF-IDF vectorizer using scikit-learn's built-in tokenizer
+            # This is deployment-safe and works on Streamlit Cloud without external dependencies
+            # Scikit-learn's built-in tokenizer handles:
+            # - Lowercasing (case-insensitive matching)
+            # - Stopword removal (removes common English words)
+            # - Tokenization (splits text into words)
+            # - N-gram extraction (captures word combinations)
             from sklearn.feature_extraction.text import TfidfVectorizer
             from sklearn.metrics.pairwise import cosine_similarity
-            import re
             
-            # CRITICAL: Add word normalization (lemmatization) to match word forms
-            # Problem: "building" vs "built", "model" vs "modeling", "skills" vs "skilled"
-            # Solution: Use lemmatization to normalize words to their root forms
-            # This ensures "Python developer" matches "python developers"
-            lemmatization_used = False
-            try:
-                import spacy
-                nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-                lemmatization_used = True
-                
-                def lemmatize_tokenizer(text):
-                    """Tokenize and lemmatize text for TF-IDF"""
-                    # Process text with spaCy
-                    doc = nlp(text.lower())
-                    # Extract lemmatized tokens (excluding stopwords and punctuation)
-                    # CRITICAL: Also filter out very short tokens and ensure we get meaningful words
-                    lemmas = [
-                        token.lemma_.lower().strip() 
-                        for token in doc 
-                        if not token.is_stop 
-                        and not token.is_punct 
-                        and token.lemma_.strip()
-                        and len(token.lemma_.strip()) > 1  # Filter single characters
-                    ]
-                    return lemmas
-                
-                # Use custom tokenizer with lemmatization
-                # NOTE: When using custom tokenizer, don't use stop_words or token_pattern
-                # CRITICAL FIX: max_df=0.95 was filtering out words that appear in both documents!
-                # With only 2 documents, words in both = 100% document frequency, so they get filtered
-                # Set max_df=1.0 to include ALL words, even if they appear in all documents
-                vectorizer = TfidfVectorizer(
-                    tokenizer=lemmatize_tokenizer,  # Custom tokenizer with lemmatization
-                    lowercase=False,                 # Already handled in tokenizer
-                    max_features=None,                # Don't limit vocabulary - include all words
-                    ngram_range=(1, 1),               # USE ONLY UNIGRAMS (single words)
-                    min_df=1,                         # Term must appear in at least 1 doc
-                    max_df=1.0                        # Include ALL words (even if in 100% of docs)
-                )
-            except (OSError, ImportError) as e:
-                # Fallback: Use NLTK Porter Stemmer if spaCy not available
-                try:
-                    from nltk.stem import PorterStemmer
-                    from nltk.tokenize import word_tokenize
-                    import nltk
-                    
-                    # Download required NLTK data if needed
-                    try:
-                        nltk.data.find('tokenizers/punkt')
-                    except LookupError:
-                        nltk.download('punkt', quiet=True)
-                    
-                    stemmer = PorterStemmer()
-                    lemmatization_used = True
-                    
-                    def stem_tokenizer(text):
-                        """Tokenize and stem text for TF-IDF"""
-                        tokens = word_tokenize(text.lower())
-                        # Filter: keep only alphanumeric tokens, exclude stopwords manually
-                        from nltk.corpus import stopwords
-                        try:
-                            stop_words = set(stopwords.words('english'))
-                        except:
-                            stop_words = set()
-                        stems = [stemmer.stem(token) for token in tokens if token.isalnum() and token not in stop_words and len(token) > 1]
-                        return stems
-                    
-                    vectorizer = TfidfVectorizer(
-                        tokenizer=stem_tokenizer,     # Custom tokenizer with stemming
-                        lowercase=False,               # Already handled in tokenizer
-                        max_features=None,             # Don't limit vocabulary
-                        ngram_range=(1, 1),
-                        min_df=1,
-                        max_df=1.0                    # Don't filter common words
-                    )
-                except Exception as e2:
-                    # Final fallback: Standard tokenizer (no normalization)
-                    st.warning(f"⚠️ Warning: Word normalization not available (spaCy/NLTK error). Word forms may not match.")
-                    st.warning(f"   Error: {str(e2)}")
-                    vectorizer = TfidfVectorizer(
-                        stop_words='english',
-                        lowercase=True,
-                        max_features=5000,
-                        ngram_range=(1, 1),
-                        min_df=1,
-                        max_df=0.95
-                    )
+            # Use scikit-learn's built-in tokenizer - no external dependencies required
+            # This ensures the app works on Streamlit Cloud without NLTK or spaCy downloads
+            # Parameters:
+            # - stop_words='english': Removes common English stopwords
+            # - ngram_range=(1, 2): Uses unigrams and bigrams for better matching
+            # - max_features=5000: Limits vocabulary size for efficiency
+            # - lowercase=True: Case-insensitive matching
+            # - min_df=1, max_df=0.95: Filters very rare and very common terms
+            vectorizer = TfidfVectorizer(
+                stop_words='english',      # Built-in English stopword removal
+                lowercase=True,            # Case-insensitive matching
+                ngram_range=(1, 2),        # Unigrams and bigrams for better phrase matching
+                max_features=5000,         # Limit vocabulary size for efficiency
+                min_df=1,                  # Term must appear in at least 1 document
+                max_df=0.95                # Ignore terms appearing in >95% of documents
+            )
             
             # Step 3: Fit and transform ALL documents together
             # This creates a consistent feature space where all documents share the same vocabulary
             # CRITICAL: Must fit on ALL documents (job + resumes) together
-            
-            # DEBUG: Show lemmatized tokens for first document (if using custom tokenizer)
-            if lemmatization_used and hasattr(vectorizer, 'tokenizer'):
-                with st.expander("🔍 Lemmatization Test (Click to view)"):
-                    try:
-                        # Test the tokenizer on sample text
-                        test_text = "Python developer building models"
-                        if hasattr(vectorizer.tokenizer, '__call__'):
-                            tokens = vectorizer.tokenizer(test_text)
-                            st.write(f"**Test lemmatization:** '{test_text}' -> {tokens}")
-                        
-                        # Show what tokens are extracted from actual documents
-                        # NOTE: We process the FULL document, not just first 200 chars
-                        st.write(f"\n**Job description tokens (sample from FULL document):**")
-                        if len(all_documents) > 0:
-                            # Process FULL document, show first 20 tokens as sample
-                            job_tokens = vectorizer.tokenizer(all_documents[0]) if hasattr(vectorizer.tokenizer, '__call__') else []
-                            st.write(f"Total tokens: {len(job_tokens)}")
-                            st.write(f"Sample (first 20): {job_tokens[:20]}...")
-                        
-                        if len(all_documents) > 1:
-                            st.write(f"\n**First resume tokens (sample from FULL document):**")
-                            # Process FULL document, show first 20 tokens as sample
-                            resume_tokens = vectorizer.tokenizer(all_documents[1]) if hasattr(vectorizer.tokenizer, '__call__') else []
-                            st.write(f"Total tokens: {len(resume_tokens)}")
-                            st.write(f"Sample (first 20): {resume_tokens[:20]}...")
-                    except Exception as e:
-                        st.write(f"Could not test tokenizer: {e}")
-            
-            # CRITICAL: Fit on ALL documents to create shared vocabulary
-            # Then transform to get vectors
+            # This ensures TF-IDF vectors are comparable and cosine similarity works correctly
             all_vectors = vectorizer.fit_transform(all_documents).toarray()
             
-            # DEBUG: Show the actual vocabulary that was created
+            # DEBUG: Show vocabulary information (optional, can be removed in production)
             feature_names = vectorizer.get_feature_names_out()
             with st.expander("🔍 Vocabulary Debug (Click to view)"):
                 st.write(f"**Total vocabulary size:** {len(feature_names)}")
-                st.write(f"**All features:** {', '.join(feature_names)}")
+                st.write(f"**Sample features (first 50):** {', '.join(feature_names[:50])}...")
                 
                 # Check if common words are in vocabulary
                 common_words = ['python', 'machine', 'learn', 'data', 'analysis', 'model', 'build', 'streamlit', 'panda', 'numpy', 'scikit']
                 found_words = [w for w in common_words if w in feature_names]
-                st.write(f"\n**Common words found in vocabulary:** {', '.join(found_words)}")
+                if found_words:
+                    st.write(f"\n**Common words found:** {', '.join(found_words)}")
                 missing_words = [w for w in common_words if w not in feature_names]
                 if missing_words:
-                    st.write(f"**Common words MISSING from vocabulary:** {', '.join(missing_words)}")
+                    st.write(f"**Common words missing:** {', '.join(missing_words)}")
             
             # DEBUG: Check if vectors were created correctly
             if all_vectors.shape[0] != len(all_documents):
@@ -559,11 +458,8 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
                         st.write(f"  - Expected words in resume: {', '.join(found_in_resume) if found_in_resume else 'NONE'}")
                         st.write(f"  - Words that should match: {', '.join(should_match) if should_match else 'NONE'}")
                     
-                    # Show if lemmatization is active
-                    if 'lemmatization_used' in locals() and lemmatization_used:
-                        st.info("ℹ️ Word normalization (lemmatization/stemming) is ACTIVE.")
-                    else:
-                        st.error("❌ Word normalization is NOT active!")
+                    # Note: Using scikit-learn's built-in tokenizer (deployment-safe)
+                    st.info("ℹ️ Using scikit-learn's built-in tokenizer with stopword removal.")
                 else:
                     st.success(f"✅ Found {len(actual_overlap)} overlapping features: {', '.join(sorted(actual_overlap))}")
                     if len(overlap) == 0:
@@ -807,7 +703,7 @@ def main():
         This system uses:
         - **TF-IDF Vectorization** for feature extraction
         - **Cosine Similarity** for matching
-        - **NLP Preprocessing** (lemmatization, stopword removal)
+        - **NLP Preprocessing** (stopword removal, n-gram extraction)
         """)
     
     # Main content area
@@ -875,7 +771,7 @@ def main():
     st.markdown("---")
     st.markdown(
         "<div style='text-align: center; color: #666; padding: 2rem;'>"
-        "Built with ❤️ using Streamlit, scikit-learn, and spaCy"
+        "Built with ❤️ using Streamlit and scikit-learn"
         "</div>",
         unsafe_allow_html=True
     )
