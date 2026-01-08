@@ -30,7 +30,7 @@ st.set_page_config(
 st.markdown("""
     <style>
     .main-header {
-        font-size: 3vw !important;
+        font-size: clamp(2.2rem, 3vw, 4.5rem) !important;
         font-weight: bold;
         color: #1f77b4;
         text-align: center;
