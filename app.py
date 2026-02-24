@@ -10,12 +10,88 @@ import sys
 import os
 from typing import List, Dict, Optional
 import traceback
+import re
 import numpy as np
 
 # Add src directory to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from text_extraction import extract_text
+
+
+@st.cache_resource(show_spinner=False)
+def load_semantic_model():
+    """
+    Load SentenceTransformer model once and cache it.
+    Using all-MiniLM-L6-v2 for efficient, high-quality sentence embeddings.
+    
+    If the model or library is not available (e.g. on Streamlit Cloud without
+    the dependency), we gracefully fall back to a None model so the app can
+    still return results using skills + experience only.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+        return SentenceTransformer("all-MiniLM-L6-v2")
+    except Exception as e:
+        # Show a one-time warning in the app; scoring will fall back to non-semantic.
+        st.warning(
+            "Semantic model (SentenceTransformers) could not be loaded. "
+            "Falling back to skill- and experience-based scoring only."
+        )
+        return None
+
+
+def clean_text(text: str) -> str:
+    """
+    Lightweight text cleaning without NLTK.
+
+    - Lowercases text
+    - Keeps letters, digits, basic punctuation
+    - Normalizes extra whitespace
+    """
+    if not text:
+        return ""
+    text = text.lower()
+    # Keep letters, digits, whitespace and basic punctuation; drop the rest
+    text = re.sub(r"[^a-z0-9\s.,;:!?@#\$%\-\+_/]", " ", text)
+    # Collapse multiple spaces
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+EXPERIENCE_KEYWORDS = [
+    "project",
+    "projects",
+    "internship",
+    "internships",
+    "experience",
+    "experienced",
+    "developed",
+    "built",
+    "implemented",
+    "deployed",
+]
+
+
+def compute_experience_score(text: str) -> float:
+    """
+    Compute experience / context score based on presence of experience-related keywords.
+
+    Returns a percentage in [0, 100]:
+    - 0% if no experience keywords are present
+    - Up to 100% if many distinct experience keywords are present
+    """
+    if not text:
+        return 0.0
+
+    text_lower = text.lower()
+    hits = {kw for kw in EXPERIENCE_KEYWORDS if kw in text_lower}
+
+    if not EXPERIENCE_KEYWORDS:
+        return 0.0
+
+    ratio = len(hits) / len(set(EXPERIENCE_KEYWORDS))
+    return max(0.0, min(100.0, ratio * 100.0))
 
 
 # Page configuration
@@ -55,86 +131,70 @@ def initialize_session_state():
         st.session_state.results = None
     if 'job_description' not in st.session_state:
         st.session_state.job_description = ""
+    # Preserve whether the last run was a single-resume vs multi-resume run
+    # so the UI can keep the intended behavior across Streamlit reruns.
+    if 'last_uploaded_count' not in st.session_state:
+        st.session_state.last_uploaded_count = 0
 
 
-def get_match_category_hybrid(match_percentage: float, matched_skill_count: int) -> tuple[str, str]:
+def get_match_category_hybrid(final_score: float, matched_skill_count: int) -> tuple[str, str]:
     """
-    HYBRID DECISION LOGIC: Categorize match using both similarity score AND skill count.
+    HYBRID DECISION LOGIC (FINAL SCORE):
+    Categorize candidate using the final hybrid score that combines:
+    - Semantic similarity (Sentence Transformers)
+    - Skill match score
+    - Experience / context score
     
-    This hybrid approach prevents false rejections where resumes with many matched skills
-    are incorrectly rejected due to lower similarity scores. Real ATS systems consider
-    both overall relevance (similarity) and hard skill requirements (skill matches).
-    
-    Decision Rules:
-    1. HIGH MATCH: match_percentage >= 60
-       - Strong overall similarity indicates good fit regardless of explicit skill count
-    
-    2. MEDIUM MATCH: match_percentage >= 40 OR (match_percentage >= 30 AND matched_skill_count >= 5)
-       - Uses OR logic: Either good similarity (≥40%) OR sufficient skills (≥30% + ≥5 skills)
-       - This prevents rejecting skill-strong candidates with different writing styles
-    
-    3. LOW MATCH: match_percentage < 30 AND matched_skill_count < 5
-       - Uses AND logic: Both low similarity AND insufficient skills must be true
-       - Only rejects when candidate lacks both relevance and required skills
+    Decision Rules (based on final_score in [0, 100]):
+    - High Match:  final_score ≥ 65
+    - Medium Match: 45 ≤ final_score < 65
+    - Low Match:   final_score < 45
     
     Args:
-        match_percentage: TF-IDF cosine similarity score (0-100)
-        matched_skill_count: Number of skills found in both JD and resume
+        final_score: Final hybrid ATS-style score (0-100)
+        matched_skill_count: Number of matched skills (kept for potential future use)
         
     Returns:
         Tuple of (category_label, emoji)
     """
-    # Rule 1: HIGH MATCH - Strong similarity score (≥60%) indicates good overall fit
-    # This candidate has strong textual similarity regardless of explicit skill count
-    if match_percentage >= 60:
+    # HIGH MATCH: Strong overall fit across semantic similarity, skills, and experience.
+    if final_score >= 65:
         return "High Match", "⭐"
     
-    # Rule 2: MEDIUM MATCH - Uses OR logic to prevent false rejections
-    # Condition A: Good similarity (≥40%) - proceed even with fewer skills
-    # Condition B: Lower similarity (30-39%) BUT has sufficient skills (≥5) - skill match compensates
-    # OR logic ensures: If EITHER condition is true, candidate is still viable
-    # This prevents rejecting candidates who have required skills but different wording
-    elif match_percentage >= 40 or (match_percentage >= 30 and matched_skill_count >= 5):
+    # MEDIUM MATCH: Reasonable fit; may be considered depending on context.
+    elif final_score >= 45:
         return "Medium Match", "⚠️"
     
-    # Rule 3: LOW MATCH - Uses AND logic for strict rejection
-    # Both conditions must be true: low similarity (<30%) AND insufficient skills (<5)
-    # AND logic ensures: Only reject when candidate lacks BOTH relevance AND skills
-    # This prevents rejecting candidates who have either good similarity OR sufficient skills
+    # LOW MATCH: Hybrid score too low; candidate is unlikely to be a good fit.
     else:
         return "Low Match", "❌"
 
 
-def get_recommendation_hybrid(match_percentage: float, matched_skill_count: int) -> str:
+def get_recommendation_hybrid(final_score: float, matched_skill_count: int) -> str:
     """
-    HYBRID DECISION LOGIC: Get recruiter recommendation using both similarity and skills.
-    
-    This function provides recommendations that reflect the hybrid decision logic,
-    giving context about why a candidate is recommended or not.
+    HYBRID DECISION LOGIC: Get recruiter recommendation from final hybrid score.
     
     Recommendation rules match the category logic:
-    - High Match (≥60%): Strong candidate
-    - Medium Match (≥40% OR (≥30% AND ≥5 skills)): Can be considered
-    - Low Match (<30% AND <5 skills): Not recommended
+    - High Match  (final_score ≥ 65): Strong candidate
+    - Medium Match (45 ≤ final_score < 65): Can be considered
+    - Low Match   (final_score < 45): Not recommended
     
     Args:
-        match_percentage: TF-IDF cosine similarity score (0-100)
-        matched_skill_count: Number of skills found in both JD and resume
+        final_score: Final hybrid ATS-style score (0-100)
+        matched_skill_count: Number of matched skills (kept for potential use / logging)
         
     Returns:
         Recommendation text string
     """
-    # High Match: Strong candidate based on overall similarity (≥60%)
-    if match_percentage >= 60:
+    # High Match: Strong candidate based on overall hybrid score
+    if final_score >= 65:
         return "Strong candidate for interview"
     
-    # Medium Match: Uses OR logic - either good similarity OR sufficient skills
-    # This recommendation applies when candidate meets medium match criteria
-    elif match_percentage >= 40 or (match_percentage >= 30 and matched_skill_count >= 5):
+    # Medium Match: Can be considered depending on role and competition
+    elif final_score >= 45:
         return "Can be considered due to skill match"
     
-    # Low Match: Both low similarity AND insufficient skills (AND logic)
-    # Only recommend rejection when candidate lacks both dimensions
+    # Low Match: Not recommended for shortlisting
     else:
         return "Not recommended for shortlisting"
 
@@ -256,10 +316,11 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
             return None
         
         # Step 1: Extract FULL text from all uploaded resume files
-        # Note: We process the complete document, not just a portion
-        # This ensures all skills and experience are captured for accurate matching
+        # Note: We process the complete document, not just a portion.
+        # This ensures all skills and experience are captured for accurate matching.
         resume_texts = []
         resume_names = []
+        extraction_debug: list[tuple[str, int]] = []  # (filename, extracted_length)
         
         with st.spinner("Extracting text from resumes..."):
             for uploaded_file in uploaded_files:
@@ -267,16 +328,26 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
                     file_content = uploaded_file.read()
                     # Extract FULL text from PDF/DOCX/TXT files
                     text = extract_text(file_content, uploaded_file.name)
+                    text_len = len(text.strip()) if text else 0
+                    extraction_debug.append((uploaded_file.name, text_len))
                     
                     if text and text.strip():
                         # Store complete resume text for processing
                         resume_texts.append(text)
                         resume_names.append(uploaded_file.name)
                     else:
-                        st.warning(f"⚠️ Could not extract text from {uploaded_file.name}. Skipping...")
+                        # If text extraction fails or returns empty, warn and skip this file
+                        st.warning(f"⚠️ Could not extract text from {uploaded_file.name} (0 characters). Skipping...")
                 except Exception as e:
                     st.warning(f"⚠️ Error processing {uploaded_file.name}: {str(e)}. Skipping...")
+                    extraction_debug.append((uploaded_file.name, 0))
                     continue
+        
+        # Debug: Show extracted text lengths for each resume so we can confirm PDF/DOCX/TXT extraction.
+        # This helps quickly identify cases where extraction silently fails.
+        with st.expander("🔍 Extraction Debug (Click to view)"):
+            for fname, length in extraction_debug:
+                st.write(f"- {fname}: {length} characters extracted")
         
         if not resume_texts:
             st.error("No valid text could be extracted from the uploaded files.")
@@ -295,251 +366,140 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
             if len(text.strip()) < 10:
                 st.warning(f"⚠️ Warning: Resume '{resume_names[i]}' is very short. Results may be inaccurate.")
         
-        # BULLETPROOF FIX: Use direct sklearn implementation (no wrapper classes)
-        # This ensures we're using the exact same logic that works in tests
+        # --- HYBRID SCORING PIPELINE ---------------------------------------
+        # 1) Semantic similarity (Sentence Transformers)
+        # 2) Skill-based match score
+        # 3) Experience / context score
+        # final_score = 0.5 * semantic + 0.3 * skills + 0.2 * experience
+        # -------------------------------------------------------------------
+
+        # Prepare cleaned texts for semantic model
+        jd_clean = clean_text(job_description)
+        resumes_clean = [clean_text(text) for text in resume_texts]
         
-        with st.spinner("Vectorizing documents..."):
-            # Step 1: Prepare documents - combine job description + resumes
-            # CRITICAL: Job description MUST be first to maintain index 0
-            # IMPORTANT: We process the FULL text of all documents, not just a portion
-            all_documents = [job_description.strip()] + [text.strip() for text in resume_texts]
+        # Load sentence-transformer model once (cached)
+        model = load_semantic_model()
+        
+        # Default: no semantic signal (will be overridden if model works)
+        semantic_scores = np.zeros(len(resume_texts), dtype=float)
+        
+        if model is not None:
+            try:
+                with st.spinner("Computing semantic similarity with Sentence Transformers..."):
+                    # Encode job description and resumes into embeddings
+                    jd_emb = model.encode(
+                        jd_clean,
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                    )
+                    resume_embs = model.encode(
+                        resumes_clean,
+                        convert_to_numpy=True,
+                        normalize_embeddings=True,
+                    )  # shape: (n_resumes, dim)
+                    
+                    # Cosine similarity via dot product (embeddings are normalized).
+                    # Raw range is [-1, 1]. We normalize to [0, 100] using:
+                    #   norm_sim = (cos + 1) / 2  -> [0, 1]
+                    #   semantic_scores = norm_sim * 100
+                    semantic_sims = np.dot(resume_embs, jd_emb)  # (n_resumes,)
+                    norm_sims = (semantic_sims + 1.0) / 2.0
+                    semantic_scores = np.clip(norm_sims * 100.0, 0.0, 100.0)
+            except Exception as e:
+                # If anything goes wrong with embeddings, log the issue and fall back
+                st.warning(
+                    "Semantic similarity computation failed; falling back to "
+                    "skill- and experience-based scoring only."
+                )
+
+        # Skill-based scoring: compute required skills once from job description
+        job_skills = extract_skills_from_text(job_description)
+        total_required_skills = len(job_skills)
+
+        results: List[Dict] = []
+
+        for i, name in enumerate(resume_names):
+            resume_text = resume_texts[i]
             
-            # Show document info to confirm full text processing
-            total_chars = sum(len(doc) for doc in all_documents)
-            st.info(f"📄 Processing FULL documents: Job ({len(job_description)} chars) + {len(resume_texts)} resume(s) = {total_chars:,} total characters")
+            # A) Semantic similarity component (0–100)
+            semantic_score = float(semantic_scores[i])
             
-            # Step 2: Create TF-IDF vectorizer using scikit-learn's built-in tokenizer
-            # This is deployment-safe and works on Streamlit Cloud without external dependencies
-            # Scikit-learn's built-in tokenizer handles:
-            # - Lowercasing (case-insensitive matching)
-            # - Stopword removal (removes common English words)
-            # - Tokenization (splits text into words)
-            # - N-gram extraction (captures word combinations)
-            from sklearn.feature_extraction.text import TfidfVectorizer
-            from sklearn.metrics.pairwise import cosine_similarity
+            # B) Skill-based component (0–100)
+            #    Use existing keyword matcher to get matched / missing skills.
+            matched_skills, missing_skills = match_skills(job_description, resume_text)
+            matched_skill_count = len(matched_skills)
             
-            # Use scikit-learn's built-in tokenizer - no external dependencies required
-            # This ensures the app works on Streamlit Cloud without NLTK or spaCy downloads
-            # Parameters:
-            # - stop_words='english': Removes common English stopwords
-            # - ngram_range=(1, 2): Uses unigrams and bigrams for better matching
-            # - max_features=5000: Limits vocabulary size for efficiency
-            # - lowercase=True: Case-insensitive matching
-            # - min_df=1, max_df=0.95: Filters very rare and very common terms
-            vectorizer = TfidfVectorizer(
-                stop_words='english',      # Built-in English stopword removal
-                lowercase=True,            # Case-insensitive matching
-                ngram_range=(1, 2),        # Unigrams and bigrams for better phrase matching
-                max_features=5000,         # Limit vocabulary size for efficiency
-                min_df=1,                  # Term must appear in at least 1 document
-                max_df=0.95                # Ignore terms appearing in >95% of documents
+            # Each unique skill is counted once; repeating the same skill word
+            # many times in the resume does NOT increase matched_skill_count.
+            if total_required_skills > 0:
+                skill_match_score = (matched_skill_count / total_required_skills) * 100.0
+            else:
+                skill_match_score = 0.0
+            
+            # C) Experience / context component (0–100)
+            keyword_context_score = compute_experience_score(resume_text)
+            
+            # BASE HYBRID SCORE (0–100)
+            # Updated weights to strongly prioritize semantic understanding:
+            #   0.55 * semantic + 0.30 * skills + 0.15 * context
+            final_score = (
+                0.55 * semantic_score
+                + 0.30 * skill_match_score
+                + 0.15 * keyword_context_score
             )
             
-            # Step 3: Fit and transform ALL documents together
-            # This creates a consistent feature space where all documents share the same vocabulary
-            # CRITICAL: Must fit on ALL documents (job + resumes) together
-            # This ensures TF-IDF vectors are comparable and cosine similarity works correctly
-            all_vectors = vectorizer.fit_transform(all_documents).toarray()
+            # HARD GATING RULE:
+            # If both semantic similarity and skill match are low, cap score at 40 (Low Match).
+            if skill_match_score < 30.0 and semantic_score < 45.0:
+                final_score = min(final_score, 40.0)
             
-            # DEBUG: Show vocabulary information (optional, can be removed in production)
-            feature_names = vectorizer.get_feature_names_out()
-            with st.expander("🔍 Vocabulary Debug (Click to view)"):
-                st.write(f"**Total vocabulary size:** {len(feature_names)}")
-                st.write(f"**Sample features (first 50):** {', '.join(feature_names[:50])}...")
-                
-                # Check if common words are in vocabulary
-                common_words = ['python', 'machine', 'learn', 'data', 'analysis', 'model', 'build', 'streamlit', 'panda', 'numpy', 'scikit']
-                found_words = [w for w in common_words if w in feature_names]
-                if found_words:
-                    st.write(f"\n**Common words found:** {', '.join(found_words)}")
-                missing_words = [w for w in common_words if w not in feature_names]
-                if missing_words:
-                    st.write(f"**Common words missing:** {', '.join(missing_words)}")
+            # STRONGER ANTI SKILL-STUFFING RULE:
+            # If skills are very high (>70%) but semantic similarity is still low (<50%),
+            # treat this as keyword stuffing and subtract 15 points.
+            if skill_match_score > 70.0 and semantic_score < 50.0:
+                final_score -= 15.0
             
-            # DEBUG: Check if vectors were created correctly
-            if all_vectors.shape[0] != len(all_documents):
-                st.error(f"❌ CRITICAL: Vector count mismatch! Expected {len(all_documents)}, got {all_vectors.shape[0]}")
-                return None
+            # Clamp final score to [0, 100]
+            final_score = max(0.0, min(100.0, final_score))
             
-            # Step 4: Extract job vector (index 0) and resume vectors (indices 1+)
-            # Keep job vector as 2D array (1 x n_features) for sklearn compatibility
-            job_vector = all_vectors[0:1]  # Shape: (1, n_features)
-            resume_vectors = all_vectors[1:]  # Shape: (n_resumes, n_features)
+            # Map final_score to match category and recommendation
+            category, emoji = get_match_category_hybrid(final_score, matched_skill_count)
+            recommendation = get_recommendation_hybrid(final_score, matched_skill_count)
             
-            # Validation checks
-            if len(resume_names) != len(resume_vectors):
-                raise ValueError(
-                    f"Critical error: {len(resume_names)} resumes but {len(resume_vectors)} vectors"
-                )
+            # Human-readable explanation for this resume's score breakdown.
+            score_explanation = (
+                f"Semantic Score: {semantic_score:.1f}%, "
+                f"Skill Score: {skill_match_score:.1f}%, "
+                f"Context Score: {keyword_context_score:.1f}%, "
+                f"Final Score: {final_score:.1f}%"
+            )
+            if skill_match_score < 30.0 and semantic_score < 45.0:
+                score_explanation += " (hard gating applied: low skills and low semantic match)"
+            elif skill_match_score > 70.0 and semantic_score < 50.0:
+                score_explanation += " (skill-stuffing penalty applied)"
             
-            # Debug information (can be removed in production)
-            job_vector_sum = job_vector.sum()
-            resume_vector_sums = [vec.sum() for vec in resume_vectors]
-            
-            # Check for zero vectors (indicates text extraction problem)
-            if job_vector_sum == 0:
-                st.error("❌ ERROR: Job description vector is all zeros. Text extraction may have failed.")
-                st.error(f"Job description text length: {len(job_description.strip())} characters")
-                return None
-            
-            # Check resume vectors
-            zero_vector_count = sum(1 for s in resume_vector_sums if s == 0)
-            if zero_vector_count > 0:
-                st.warning(f"⚠️ Warning: {zero_vector_count} resume(s) have zero vectors. They will show 0% match.")
-            
-            # Verify vector dimensions match
-            if job_vector.shape[1] != resume_vectors.shape[1]:
-                st.error(f"❌ CRITICAL ERROR: Dimension mismatch! Job: {job_vector.shape[1]}, Resumes: {resume_vectors.shape[1]}")
-                return None
-        
-        # Step 5: Calculate cosine similarity using sklearn directly
-        with st.spinner("Calculating similarity scores..."):
-            # DEBUG: Show vector information
-            with st.expander("🔍 Debug Information (Click to view)"):
-                st.write(f"**Vector Shapes:**")
-                st.write(f"- Job vector: {job_vector.shape}")
-                st.write(f"- Resume vectors: {resume_vectors.shape}")
-                st.write(f"- Number of features: {job_vector.shape[1]}")
-                
-                st.write(f"\n**Vector Statistics:**")
-                st.write(f"- Job vector sum: {job_vector_sum:.4f}")
-                st.write(f"- Job vector non-zero elements: {np.count_nonzero(job_vector)}")
-                for i, (name, vec_sum) in enumerate(zip(resume_names, resume_vector_sums)):
-                    st.write(f"- {name}: sum={vec_sum:.4f}, non-zero={np.count_nonzero(resume_vectors[i])}")
-                
-                # Show sample of job description and first resume
-                # NOTE: We process the FULL document, this is just a preview for debugging
-                st.write(f"\n**Text Preview (FULL documents are processed):**")
-                st.write(f"- Job description: {len(job_description)} chars total")
-                st.write(f"  Preview (first 200 chars): {job_description[:200]}...")
-                if resume_texts:
-                    for i, resume_text in enumerate(resume_texts):
-                        st.write(f"- Resume {i+1} ({resume_names[i]}): {len(resume_text)} chars total")
-                        st.write(f"  Preview (first 200 chars): {resume_text[:200]}...")
-            
-            # CRITICAL CHECK: Verify there's vocabulary overlap
-            # Check if job vector and resume vectors share any non-zero features
-            job_nonzero_indices = set(np.nonzero(job_vector[0])[0])
-            feature_names = vectorizer.get_feature_names_out()
-            
-            for i, (name, resume_vec) in enumerate(zip(resume_names, resume_vectors)):
-                resume_nonzero_indices = set(np.nonzero(resume_vec)[0])
-                overlap = job_nonzero_indices.intersection(resume_nonzero_indices)
-                
-                # Show ALL features, not just a sample
-                job_feature_indices = list(job_nonzero_indices)
-                resume_feature_indices = list(resume_nonzero_indices)
-                
-                job_features = [feature_names[idx] for idx in job_feature_indices]
-                resume_features = [feature_names[idx] for idx in resume_feature_indices]
-                
-                job_set = set(job_features)
-                resume_set = set(resume_features)
-                actual_overlap = job_set.intersection(resume_set)
-                
-                if len(actual_overlap) == 0:
-                    st.error(f"❌ CRITICAL: No vocabulary overlap detected for '{name}'. This will result in 0% similarity.")
-                    
-                    st.write(f"  **ALL Job features ({len(job_features)}):** {', '.join(sorted(job_features))}")
-                    st.write(f"  **ALL Resume features ({len(resume_features)}):** {', '.join(sorted(resume_features))}")
-                    
-                    # Check for expected matches
-                    expected_words = ['python', 'machine', 'learn', 'data', 'analysis', 'model', 'build', 'streamlit', 'panda', 'numpy', 'scikit', 'science']
-                    found_in_job = [w for w in expected_words if w in job_set]
-                    found_in_resume = [w for w in expected_words if w in resume_set]
-                    should_match = [w for w in expected_words if w in job_set and w in resume_set]
-                    
-                    st.write(f"\n  **Analysis:**")
-                    if should_match:
-                        st.error(f"  ❌ BUG DETECTED! These words SHOULD match but vectors show 0 overlap: {', '.join(should_match)}")
-                        st.error(f"  This indicates the vectors are not being extracted correctly!")
-                    else:
-                        st.write(f"  - Expected words in job: {', '.join(found_in_job) if found_in_job else 'NONE'}")
-                        st.write(f"  - Expected words in resume: {', '.join(found_in_resume) if found_in_resume else 'NONE'}")
-                        st.write(f"  - Words that should match: {', '.join(should_match) if should_match else 'NONE'}")
-                    
-                    # Note: Using scikit-learn's built-in tokenizer (deployment-safe)
-                    st.info("ℹ️ Using scikit-learn's built-in tokenizer with stopword removal.")
-                else:
-                    st.success(f"✅ Found {len(actual_overlap)} overlapping features: {', '.join(sorted(actual_overlap))}")
-                    if len(overlap) == 0:
-                        st.error(f"  ❌ BUG: Feature sets overlap but vector indices don't! This is a critical error.")
-                        st.write(f"  Feature overlap: {actual_overlap}")
-                        st.write(f"  Vector index overlap: {overlap}")
-            
-            # Use sklearn's cosine_similarity directly (most reliable)
-            # Input: resume_vectors (n_resumes x n_features), job_vector (1 x n_features)
-            # Output: (n_resumes x 1) array
-            similarities = cosine_similarity(resume_vectors, job_vector)
-            
-            # DEBUG: Show raw similarities before conversion
-            with st.expander("🔍 Debug Information (Click to view)"):
-                st.write(f"**Raw Similarity Scores:**")
-                for name, sim in zip(resume_names, similarities.flatten()):
-                    st.write(f"- {name}: {sim:.6f} (raw), {sim*100:.2f}%")
-                
-                # Show vocabulary overlap info
-                st.write(f"\n**Vocabulary Overlap:**")
-                for i, (name, resume_vec) in enumerate(zip(resume_names, resume_vectors)):
-                    job_nonzero = set(np.nonzero(job_vector[0])[0])
-                    resume_nonzero = set(np.nonzero(resume_vec)[0])
-                    overlap_count = len(job_nonzero.intersection(resume_nonzero))
-                    st.write(f"- {name}: {overlap_count} overlapping features out of {len(job_nonzero)} job features")
-            
-            # Flatten to 1D array (n_resumes,)
-            similarity_scores = similarities.flatten()
-            
-            # HYBRID DECISION LOGIC: Convert to percentages and create results
-            # This step implements the hybrid approach that considers BOTH similarity score AND skill count
-            # This prevents false rejections where resumes with many matched skills are rejected
-            # due to lower similarity scores (e.g., different writing style but same skills)
-            results = []
-            for i, (name, score) in enumerate(zip(resume_names, similarity_scores)):
-                # Step 1: Calculate match percentage from TF-IDF cosine similarity
-                # This represents overall textual relevance between job description and resume
-                score_clamped = max(0.0, min(1.0, float(score)))
-                match_percentage = score_clamped * 100.0
-                
-                # Step 2: Extract and match skills for this resume
-                # This identifies hard skill requirements that are explicitly mentioned
-                # Note: resume_texts[i] corresponds to resume_names[i] - process FULL text
-                matched_skills, missing_skills = match_skills(job_description, resume_texts[i])
-                matched_skill_count = len(matched_skills)
-                
-                # Step 3: Apply HYBRID DECISION LOGIC
-                # Decision considers BOTH:
-                #   - match_percentage: Overall textual similarity (TF-IDF cosine similarity)
-                #   - matched_skill_count: Number of hard skills found in both documents
-                # 
-                # Why hybrid logic?
-                # - Prevents false rejections: A resume with 8 matched skills but 35% similarity
-                #   should not be rejected if skills are critical requirements
-                # - Balances soft and hard requirements: Similarity captures overall fit,
-                #   skill count captures specific technical requirements
-                # - Mimics real ATS behavior: Professional ATS systems use multi-factor scoring
-                category, emoji = get_match_category_hybrid(match_percentage, matched_skill_count)
-                recommendation = get_recommendation_hybrid(match_percentage, matched_skill_count)
-                
-                # Step 4: Build result dictionary with all information
-                # This includes both similarity metrics and skill analysis for transparency
-                results.append({
-                    'name': name,
-                    'score': match_percentage,  # Match percentage for display
-                    'raw_score': score_clamped,  # Raw similarity score
-                    'matched_skill_count': matched_skill_count,  # Number of matched skills
-                    'category': category,  # Final category from hybrid logic
-                    'emoji': emoji,  # Category emoji
-                    'recommendation': recommendation,  # Recruiter recommendation
-                    'matched_skills': sorted(matched_skills),  # List of matched skills
-                    'missing_skills': sorted(missing_skills)  # List of missing skills
-                })
-            
-            # Sort by score (descending) and add rank
-            # This ensures best matches appear first
-            results.sort(key=lambda x: x['score'], reverse=True)
-            for idx, result in enumerate(results, start=1):
-                result['rank'] = idx
-        
+            results.append(
+                {
+                    "name": name,
+                    "score": final_score,  # Final hybrid score for display
+                    "semantic_score": semantic_score,
+                    "skill_match_score": skill_match_score,
+                    "keyword_context_score": keyword_context_score,
+                    "matched_skill_count": matched_skill_count,
+                    "category": category,
+                    "emoji": emoji,
+                    "recommendation": recommendation,
+                    "matched_skills": sorted(matched_skills),
+                    "missing_skills": sorted(missing_skills),
+                    "score_explanation": score_explanation,
+                }
+            )
+
+        # Sort by final hybrid score (descending) and add rank
+        results.sort(key=lambda x: x["score"], reverse=True)
+        for idx, result in enumerate(results, start=1):
+            result["rank"] = idx
+
         return results
     
     except Exception as e:
@@ -651,19 +611,20 @@ def display_results(results: List[Dict]):
                         st.success("All required skills present! 🎉")
                 
                 # Decision explanation with correct hybrid logic description
-                # This explains how the system combines similarity and skill matching
+                # This explains how the system combines semantic similarity, skills, and experience
                 with st.expander("ℹ️ How this decision was made"):
-                    st.markdown("**The system uses a hybrid evaluation approach:**")
+                    st.markdown("**The system uses a hybrid ATS-style evaluation approach:**")
                     st.markdown("""
-                    • **TF-IDF similarity** measures overall relevance between resume and job description
-                    • **Skill matching** verifies required technical skills
+                    • **Semantic similarity** (Sentence Transformers) measures how closely the resume meaning matches the job description  
+                    • **Skill matching** verifies required technical skills from the job description  
+                    • **Experience keywords** (projects, internships, built, developed, etc.) provide additional context weighting
                     """)
                     st.markdown("---")
                     st.markdown("**Decision rules:**")
                     st.markdown("""
-                    • **High Match:** Similarity ≥ 60%
-                    • **Medium Match:** Similarity ≥ 40% OR (Similarity ≥ 30% AND at least 5 skills matched)
-                    • **Low Match:** Similarity < 30% AND fewer than 5 skills matched
+                    • **High Match:** Final hybrid score ≥ 65  
+                    • **Medium Match:** 45 ≤ Final hybrid score < 65  
+                    • **Low Match:** Final hybrid score < 45
                     """)
                     st.markdown("---")
                     st.caption("This hybrid approach reduces false rejections and reflects real-world ATS shortlisting behavior.")
@@ -671,12 +632,71 @@ def display_results(results: List[Dict]):
                     # Show specific values for this candidate
                     st.markdown("---")
                     st.markdown("**This candidate's metrics:**")
-                    st.write(f"• Match Percentage: {result['score']:.2f}%")
+                    st.write(f"• Final Hybrid Score: {result['score']:.2f}%")
                     st.write(f"• Matched Skills: {matched_count} skills")
                     st.write(f"• Final Category: {result['category']}")
                     st.write(f"• Recommendation: {result['recommendation']}")
             
             st.markdown("---")
+
+
+def display_ranked_table(results: List[Dict]) -> None:
+    """
+    ATS-style multi-candidate ranking view (for multiple uploaded resumes):
+    - Highlight Top 3 candidates
+    - Show a ranked table of all candidates
+    
+    IMPORTANT: This function does not recompute scores; it only formats the
+    already-computed `results` list returned by `process_resumes`.
+    """
+    import pandas as pd
+
+    if not results:
+        st.info("No results to display.")
+        return
+
+    # ---- Top 3 highlight section ----
+    st.markdown("---")
+    st.markdown("## 🔥 Top 3 Candidates")
+
+    top_n = min(3, len(results))
+    for r in results[:top_n]:
+        category_display = f"{r.get('emoji', '')} {r.get('category', '')}".strip()
+        text = (
+            f"**#{r.get('rank', '-')}. {r.get('name', 'Unknown')}**  \n"
+            f"Final Score: **{float(r.get('score', 0.0)):.2f}%**  \n"
+            f"Category: **{category_display}**"
+        )
+
+        # Highlight based on final category (recruiter-friendly)
+        if r.get("category") == "High Match":
+            st.success(text)
+        elif r.get("category") == "Medium Match":
+            st.warning(text)
+        else:
+            st.error(text)
+
+    # ---- Full ranked table ----
+    st.markdown("---")
+    st.markdown("## 📋 All Candidates (Ranked)")
+
+    # Build the structured list requested
+    table_rows: list[dict] = []
+    for r in results:
+        table_rows.append(
+            {
+                "Rank": r.get("rank"),
+                "name": r.get("name"),
+                "semantic": round(float(r.get("semantic_score", 0.0)), 2),
+                "skill": round(float(r.get("skill_match_score", 0.0)), 2),
+                "context": round(float(r.get("keyword_context_score", 0.0)), 2),
+                "final": round(float(r.get("score", 0.0)), 2),
+                "category": f"{r.get('emoji', '')} {r.get('category', '')}".strip(),
+            }
+        )
+
+    df = pd.DataFrame(table_rows).sort_values("Rank", ascending=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
 
 def main():
@@ -701,9 +721,14 @@ def main():
         st.markdown("### ℹ️ About")
         st.markdown("""
         This system uses:
-        - **TF-IDF Vectorization** for feature extraction
-        - **Cosine Similarity** for matching
-        - **NLP Preprocessing** (stopword removal, n-gram extraction)
+        - **Semantic Similarity** (Sentence Transformers: `all-MiniLM-L6-v2`) to capture meaning beyond exact keywords
+        - **Skill Keyword Matching** to verify required skills from the job description
+        - **Experience / Context Signals** (projects, internships, built, developed, etc.) for practical relevance
+        - **Hybrid ATS Score** (weighted combination + gating + anti-skill-stuffing rules)
+        
+        Notes:
+        - Supports **multiple PDF resumes** and ranks candidates like an ATS
+        - The semantic model is loaded once using caching for **Streamlit Cloud efficiency**
         """)
     
     # Main content area
@@ -712,10 +737,10 @@ def main():
     with col1:
         st.markdown("### 📁 Upload Resumes")
         uploaded_files = st.file_uploader(
-            "Choose resume files",
-            type=['pdf', 'docx', 'txt', 'doc'],
+            "Choose resume PDF files",
+            type=['pdf'],
             accept_multiple_files=True,
-            help="Upload one or more resume files in PDF, DOCX, or TXT format"
+            help="Upload one or more resume PDFs"
         )
         
         if uploaded_files:
@@ -761,11 +786,20 @@ def main():
             
             if results:
                 st.session_state.results = results
-                display_results(results)
+                st.session_state.last_uploaded_count = len(uploaded_files)
+                # If only 1 resume uploaded, keep the current detailed behavior
+                if len(uploaded_files) == 1:
+                    display_results(results)
+                else:
+                    display_ranked_table(results)
     
     # Display previous results if available
     if st.session_state.results and not analyze_button:
-        display_results(st.session_state.results)
+        # Preserve behavior across reruns
+        if st.session_state.last_uploaded_count == 1:
+            display_results(st.session_state.results)
+        else:
+            display_ranked_table(st.session_state.results)
     
     # Footer
     st.markdown("---")
