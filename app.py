@@ -372,10 +372,12 @@ def process_resumes(uploaded_files: List, job_description: str) -> Optional[List
         # 3) Experience / context score
         # final_score = 0.5 * semantic + 0.3 * skills + 0.2 * experience
         # -------------------------------------------------------------------
-
-        # Prepare cleaned texts for semantic model
+        
+        # Prepare cleaned texts for semantic model.
+        # PERFORMANCE: limit resume text length to first 4000 characters before embedding
+        # to keep encoding fast and memory efficient on Streamlit Cloud.
         jd_clean = clean_text(job_description)
-        resumes_clean = [clean_text(text) for text in resume_texts]
+        resumes_clean = [clean_text(text[:4000]) for text in resume_texts]
         
         # Load sentence-transformer model once (cached)
         model = load_semantic_model()
